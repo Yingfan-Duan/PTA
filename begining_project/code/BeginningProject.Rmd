@@ -1,0 +1,1006 @@
+---
+title: "BeginningProject"
+author: "Yingfan Duan"
+date: "12/29/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+setwd("F://PTA//Beginning_Project//code")
+```
+
+## preparation
+
+#### importing data
+
+```{r}
+# packages
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(readr)
+library(corrplot)
+library(forecast)
+library(prophet)
+library(data.table)
+library(xgboost)
+library(caret)
+library(foreach)
+library(doParallel)
+# import datasets
+sales_train <- read_csv("../data/sales_train.csv")
+
+train <- fread("../data/sales_train.csv", data.table = TRUE)
+test <- fread("../data/test.csv", data.table = TRUE)
+submit <- fread("../data/sample_submission.csv", data.table = TRUE)
+
+items <- fread("../data/items.csv", data.table = TRUE)
+item_cat <- fread("../data/item_categories.csv", data.table = TRUE)
+shops <- fread("../data/shops.csv", data.table = TRUE)
+
+```
+
+
+#### data cleaning
+
+Notice in dataset **items** there is a unique catagory ID for each item, thus we merge these two datasets.
+
+```{r}
+sales_train_dat <- merge.data.frame(sales_train, items, by = c("item_id" ))
+sales_train_dat$item_name <- NULL
+
+
+# check the new data frame
+str(sales_train_dat)
+
+rm(sales_train)
+```
+
+
+Variable **date** is of character, we need to convert it into date format and extract month, day, weekday and year.
+
+```{r}
+sales_train_dat$date <- dmy(sales_train_dat$date)
+
+sales_train_dat$month <- month(sales_train_dat$date)
+sales_train_dat$day <- day(sales_train_dat$date)
+sales_train_dat$weekday <- weekdays(sales_train_dat$date)
+sales_train_dat$year <- year(sales_train_dat$date)
+
+# convert into factor if needed
+sales_train_dat$year <- as.factor(sales_train_dat$year)
+sales_train_dat$month <- as.factor(sales_train_dat$month)
+sales_train_dat$weekday <- as.factor(sales_train_dat$weekday)
+```
+
+
+our goal is to predict total sales for every product and store for next month, thus we need to compute the total sales of each month for every product and store.
+
+```{r}
+hold_df <- sales_train_dat %>% group_by(year, month, shop_id, item_id) %>% summarise(item_cnt_month = sum(item_cnt_day)) %>% ungroup() 
+
+sales_train_dat <- merge.data.frame(sales_train_dat, hold_df, by = c("year", "month", "shop_id", "item_id"))
+
+rm(hold_df)
+```
+
+## EDA
+
+### General data description
+
+```{r}
+str(sales_train_dat)
+
+dim(sales_train_dat)
+```
+
+Now the dataset has 12 variables and 2935849 records. Check some descriptive statistics.
+
+```{r}
+summary(sales_train_dat)
+```
+From these statistics we can know the data is from 2013, Jan. to 2015, Oct. Also, notice that the minimal value for variable **item_price** is -1, which indicates abnormal value. 
+
+
+### Missing data
+
+```{r}
+sum(is.na(sales_train_dat))
+is.null(sales_train_dat)
+```
+No missing values for this dataset.
+
+
+### Analyzing predict variable item_cnt_month
+
+#### descriptive statistics
+
+```{r}
+summary(sales_train_dat$item_cnt_month)
+```
+
+The lowest value is negative, which may affect some specific models in the future. 
+
+
+#### distribution
+
+Then let's check the distribution.
+
+```{r}
+ggplot(sales_train_dat)+
+  geom_density(aes(item_cnt_month))+
+  labs(title = "Density plot of items sold per month") +
+  theme_bw()
+ggsave("../images/density_plot_indep_var.png")
+```
+
+We can see that the distribution:
+
+- deviates from normal distribution
+- shows positive skewness
+- shows peakedness
+
+
+### Analyzing explanatory variables
+
+```{r}
+summary(sales_train_dat[,-12])
+```
+
+ At first glance there are 11 explanatory variables in total, but then we can notice some of them convey duplicate information. Thus we need to select meaningful variables. For those representing date(year, month, day, weekday, date_block_num), we can delete **date** and keep others. Also, there is no need to keep item_cnt_day because we only focus on monthly selling amount. 
+ 
+Therefore, we now have three categorical variables: weekday, year and month, five numerical variables: date_block_num, item_id, shop_id, item_category_id and item_price. 
+
+
+**Numerical variables**
+Among five numerical variables, we can take a look of the distribution of item_price. 
+
+```{r}
+ggplot(sales_train_dat)+
+  geom_density(aes(item_price))+
+  labs(title = "Density plot of item price") +
+  theme_bw()
+ggsave("../images/density_plot_price.png")
+```
+Delete two abnormal observations which item_price equals to -1 and 30798.
+
+New distribution plot is :
+```{r}
+sales_train_dat <- sales_train_dat %>% filter(item_price != min(item_price) & item_price!= max(item_price))
+
+ggplot(sales_train_dat)+
+  geom_density(aes(item_price))+
+  labs(title = "Density plot of item price") +
+  theme_bw()
+
+ggsave("../images/density_plot_price.png")
+```
+
+From the density plot we can learn that the distribution of item_price:
+
+- shows positive skewness
+- deviates from normal distribution
+
+
+Then let's take a look at information about stors and items.
+
+```{r}
+# shop_id
+sales_train_dat %>% select(shop_id) %>% distinct() %>% count()
+
+# item_id
+sales_train_dat %>% select(item_id) %>% distinct() %>% count()
+
+# item_category_id
+sales_train_dat %>% select(item_category_id) %>% distinct() %>% count()
+```
+
+There are 60 stores, 21807 kinds of products in 84 categories.
+
+
+### Correlation analysis
+
+#### Correlation among explanatory variables
+
+First let's check the correlation between numeric variables.
+
+```{r}
+png(filename = "../images/correlation_plot_numerical_var.png")
+cor_matrix1 <- cor(sales_train_dat[,c("shop_id", "item_id",
+                                     "item_category_id",
+                                     "item_price", 
+                                     "date_block_num")])
+corrplot(cor_matrix1, method = "square", title = "Correlation between numerical explanatory variables", tl.col = "black", 
+         tl.srt = 30, cl.ratio = 0.2, addCoef.col = TRUE)
+dev.off()
+corrplot(cor_matrix1, method = "square", title = "Correlation between numerical explanatory variables", tl.col = "black", 
+         tl.srt = 30, cl.ratio = 0.2, addCoef.col = TRUE)
+rm(cor_matrix1)
+```
+
+From the plot above we can know that there isn't significant correlation between these numerical independent variables.
+
+
+#### Correlation between predict variable and explanatory variables
+
+Then let's check the correlation between dependent variable and other numerical independent variables.
+
+```{r}
+png(filename = "../images/correlation_plot_dependent.png")
+cor_matrix2 <- cor(sales_train_dat[,c("item_cnt_month","shop_id",
+                                    "item_id","item_category_id",
+                                     "item_price",
+                                    "date_block_num")])
+corrplot(cor_matrix2, method = "square",  
+         title = "Correlation between dependent var and numerical independent var", 
+         tl.col = "black", tl.srt = 30, cl.ratio = 0.2, addCoef.col = TRUE)
+dev.off()
+corrplot(cor_matrix2, method = "square",  
+         title = "Correlation between dependent var and numerical independent var", 
+         tl.col = "black", tl.srt = 30, cl.ratio = 0.2, addCoef.col = TRUE)
+rm(cor_matrix2)
+```
+
+From the first column of the plot we can see there isn't significant linear correlation between dependent variable and numerical variables.
+
+
+#### Other correlation analysis
+
+Now let's check the relationship between dependent variable and those categorial variables.
+
+**shop_id**
+
+
+```{r}
+most_populare_shop <- sales_train_dat %>% group_by(shop_id) %>%
+  summarise(total_sale_per_shop = sum(item_cnt_day)) %>%
+  arrange(desc(total_sale_per_shop)) %>% ungroup()
+
+ggplot(data = most_populare_shop, aes(y = total_sale_per_shop, 
+            x = reorder(as.factor(shop_id), total_sale_per_shop),
+            fill = as.factor(shop_id))) +
+  geom_bar(stat = "identity")+
+  coord_flip()+
+  labs(title = "Shops with most items sold", 
+       x = "Shops", y = "Total sales", fill = "Shop ID")+
+  theme_bw()
+
+ggsave(filename = "../images/most_popular_shops.png")
+
+rm(most_populare_shop)
+```
+
+From the plot above we can know that shops with ID 31, 25, 54, 28, 42 are the top 5 shops sold the most items in total from 2013 to 2015.
+
+
+**item_id**
+
+Which stores have the most items in shop?
+
+```{r}
+most_items_inshop <- sales_train_dat %>% group_by(shop_id) %>%
+  summarise(total_items_inshop = n_distinct(item_id)) %>%
+  arrange(desc(total_items_inshop)) %>% ungroup()
+
+ggplot(most_items_inshop, aes(
+  x = reorder(as.factor(shop_id), total_items_inshop), 
+                              y = total_items_inshop, 
+                              fill = as.factor(shop_id))) +
+  geom_bar(stat="identity") +
+  coord_flip()+
+  labs(title = "Shops with most available items", 
+       x = "Shops", y = "Total number of items in shop", 
+       fill = "Shop ID") +
+  theme_bw()
+
+ggsave("../images/most_items_inshop.png")
+
+rm(most_items_inshop)
+```
+
+From the plot above we can see that shops with ID 25, 31, 54, 28, 57 are shops with most available items. Four of them are the shops sold the most items at the meantime. Thus the number of available items is possibly a strong factor of the number of items sold.
+
+
+Which item is the best seller in each shop?
+
+```{r}
+most_sold_item <- sales_train_dat %>% 
+  group_by(shop_id, item_id)%>%
+  summarise(most_sold_item_total = sum(item_cnt_day)) %>%
+  filter(most_sold_item_total == max(most_sold_item_total)) %>%
+  arrange(desc(most_sold_item_total)) %>%
+  ungroup()
+
+ggplot(data = most_sold_item, 
+       mapping = aes(x = reorder(as.factor(shop_id),  most_sold_item_total), y = most_sold_item_total, fill = as.factor(item_id)))+
+  geom_bar(stat = "identity") +
+  coord_flip()+
+  labs(title =  "Most popular item in shops", 
+       x = "Shops", 
+       y = "Most sold item in shop", 
+       fill = "Item ID")+
+  theme_bw()
+
+ggsave("../images/most_popular_item.png")
+
+rm(most_sold_item)
+```
+The most popular item in most stores is item 20949.
+
+
+**item_category_id**
+
+First let's find out which stores have the most item categories.
+
+```{r}
+most_categories_inshop <- sales_train_dat %>%
+  group_by(shop_id)%>%
+  summarise(total_categories = n_distinct(item_category_id))%>%
+  arrange(desc(total_categories))%>%
+  ungroup()
+
+ggplot(most_categories_inshop, aes(
+  x = reorder(as.factor(shop_id), total_categories), 
+  y = total_categories, 
+  fill = as.factor(shop_id))) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Shops with most item categories", 
+       x = "Shops", 
+       y = "The number of item categories", 
+       fill = "Shop ID") +
+  theme_bw()
+
+ggsave("../images/Most_categories.png")
+
+rm(most_categories_inshop)
+```
+
+From the plot above we can know that most shops keep similar amount of categories and shops with ID 25, 12, 56, 38, 37 are the top 5 shops having the most categories. 
+
+Then let's see which categories are the most popular.
+
+```{r}
+most_sold_category <- sales_train_dat %>% 
+  group_by(shop_id, item_category_id) %>% 
+  summarise(most_sold_category_total = sum(item_cnt_day)) %>%
+  filter(most_sold_category_total == max(most_sold_category_total)) %>%  
+  arrange(desc(most_sold_category_total)) %>%
+  ungroup()
+
+ggplot(most_sold_category, aes(x = reorder(as.factor(shop_id), most_sold_category_total), y = most_sold_category_total, fill = as.factor(item_category_id))) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Most popular categories in shop", 
+       x = "Shops", 
+       y = "Most popular categories sold", 
+       fill = "Item Category ID") +
+  theme_bw()
+
+ggsave("../images/most_popular_categories.png")
+
+rm(most_sold_category)
+```
+
+
+From the plot above we can see that item category 40, 31, 30 are the main popular categories in each store.
+
+
+**Highest sales category across all shops**
+
+Let's check which category sold the most across all the shops.
+
+```{r}
+highest_grossing_cat <- sales_train_dat %>% group_by(item_category_id) %>% summarise(total_sold = sum(item_cnt_day*item_price)) %>% arrange(desc(total_sold)) %>% ungroup()
+
+ggplot(highest_grossing_cat, aes(x = reorder(as.factor(item_category_id), total_sold), y = total_sold, fill = as.factor(item_category_id))) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Highest sales grossing product category", x = "Item Category ID", y = "Total sales", fill = "Item Category ID") + 
+  theme_bw()
+
+ggsave("../images/higest_grossing_cat.png")
+
+rm(highest_grossing_cat)
+```
+
+### Seasonal analysis
+
+#### Month 
+
+**Month-Day-wise total sales**
+
+```{r}
+md_wise_total_sales <- sales_train_dat %>% group_by(month, day) %>% summarise(total_everyday = sum(item_cnt_day)) %>% arrange(month, day) %>% ungroup()
+
+ggplot(md_wise_total_sales, aes(x = day, y = total_everyday, group = month, fill = as.factor(day))) +
+  geom_bar(stat = "identity") +
+  scale_x_continuous(breaks = seq(min(0), max(31), by = 1)) +
+  facet_wrap(~month,ncol = 4) +
+  labs(title = "Month-Day-wise total sales", x = "Day of Month", y = "Total sales everyday", fill = "Day") + theme_bw()
+
+ggsave("../images/month_day_wise_total_sales.png")
+
+rm(md_wise_total_sales)
+```
+
+**Year-Month-wise total sales**
+
+```{r}
+ym_wise_total_sales <- sales_train_dat %>% group_by(year, month) %>% summarise(total_sales_per_year = sum(item_cnt_day)) %>% arrange(year) %>% ungroup()
+
+ggplot(ym_wise_total_sales, aes(x = year, y = total_sales_per_year, fill = as.factor(month))) +
+  geom_bar(stat = "identity") +
+  labs(title = "Total sales per year-month", x = "Year", y = "Total sales per yar", fill = "Month") +
+  theme_bw()
+
+ggsave("../images/total_sales_year_month.png")
+
+rm(ym_wise_total_sales)
+```
+
+
+**Week analysis**
+
+```{r}
+week_total_sales <- sales_train_dat %>% group_by(weekday) %>% summarise(total_sales = sum(item_cnt_day)) %>% arrange(desc(total_sales)) %>% ungroup()
+
+ggplot(week_total_sales, aes(x = reorder(weekday, total_sales), y = total_sales, fill = weekday)) +
+  geom_bar(stat = "identity") +
+  coord_flip()+
+  labs(title = "Item sold per weekday", x = "Weekday", y = "Total sales", fill = "Weekday") +
+  theme_bw()
+
+ggsave("../images/week_total_sales.png")
+
+rm(week_total_sales)
+```
+
+## Models
+
+### XgBoost Approach
+
+#### data preprocessing
+
+```{r}
+# preprocessing
+train = train[-which(train$item_price==-1 | train$item_price>300000),]
+train[, date:= as.Date(date, "%d.%m.%Y")]
+train[, shop_id:= shop_id %>% as.character()]
+train[, item_id:= item_id %>% as.character()]
+train[, revenue:= ifelse((item_cnt_day < 0)|(item_price < 0), 0, item_price*item_cnt_day)]
+
+test[, ID:= ID %>% as.character()]
+test[, shop_id:= shop_id %>% as.character()]
+test[, item_id:= item_id %>% as.character()]
+
+items[, item_id:= item_id %>% as.character()]
+items[, item_category_id:= item_category_id %>% as.character()]
+
+item_cat[, item_category_id:= item_category_id %>% as.character()]
+
+shops[, shop_id:= shop_id %>% as.character()]
+
+# subset:  extract item_id / shop_id including in test set from train set
+sub_train <- test %>%
+  dplyr::mutate(tmp_id = 1) %>%
+  dplyr::left_join(data.frame(tmp_id = 1,
+                              date_block_num = seq(0, 34, by = 1)), by = "tmp_id") %>%
+  dplyr::left_join(train, by = c("shop_id", "item_id", "date_block_num")) %>%
+  dplyr::arrange(shop_id, item_id, date) %>%
+  dplyr::left_join(shops, by = "shop_id") %>%
+  dplyr::left_join(items, by = "item_id")
+```
+
+
+#### Feature engineering
+
+```{r}
+create_features <- function(df, target_month){
+  
+  # replace negative value and NA with 0
+  df <- df %>%
+    dplyr::mutate(
+      # item_cnt_day = ifelse(item_cnt_day < 0, 0, item_cnt_day),
+      item_price = ifelse(is.na(item_price), 0, item_price))
+  
+  # 1. stats of item_price summarized by shop_id / item_id 
+  data1 <- df %>%
+    dplyr::filter(!is.na(date)) %>%
+    dplyr::filter(date_block_num < target_month) %>%
+    dplyr::arrange(shop_id, item_id, date) %>%
+    dplyr::group_by(shop_id, item_id) %>%
+    dplyr::summarise(
+      price_min = min(item_price, na.rm = TRUE),
+      price_mean = mean(item_price, na.rm = TRUE),
+      price_median = median(item_price, na.rm = TRUE),
+      price_max = max(item_price, na.rm = TRUE),
+      price_sd = sd(item_price, na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup()
+  
+  # 2. stats of item_price summarized by item_id 
+  data2 <- df %>%
+    dplyr::filter(!is.na(date)) %>%
+    dplyr::filter(date_block_num < target_month) %>%
+    dplyr::group_by(item_id) %>%
+    dplyr::summarise(
+      price_min_all = min(item_price, na.rm = TRUE),
+      price_mean_all = mean(item_price, na.rm = TRUE),
+      price_median_all = median(item_price, na.rm = TRUE),
+      price_max_all = max(item_price, na.rm = TRUE),
+      price_sd_all = sd(item_price, na.rm = TRUE),
+      first_month = min(date_block_num, na.rm = TRUE)  # why pick first month 
+    ) %>%
+    dplyr::ungroup()
+  
+  # 3. num of sales and item price of 1~6 months before 
+  data3 <- df %>%
+    dplyr::group_by(shop_id, item_id, date_block_num) %>%  # why 1-6 months, only have 5?
+    dplyr::summarise(
+      last_sales1 = sum(item_cnt_day, na.rm = TRUE),
+      last_price1 = max(item_price, na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(shop_id, item_id, date_block_num) %>%
+    dplyr::mutate(
+      last_sales2 = lag(last_sales1, 1),
+      last_sales3 = lag(last_sales1, 2),
+      last_sales4 = lag(last_sales1, 3),
+      last_sales5 = lag(last_sales1, 4),
+      last_price2 = lag(last_price1, 1),
+      last_price3 = lag(last_price1, 2),
+      last_price4 = lag(last_price1, 3),
+      last_price5 = lag(last_price1, 4),
+      last_sales1_3_mean = (last_sales1 + last_sales2 + last_sales3)/3  # why compute mean?
+    ) %>%
+    dplyr::filter(date_block_num == target_month - 1)
+  
+  # 4. stats of total num sales summarized by shop_id / item_id, count num of month with no sales
+  data4 <- df %>%
+    dplyr::filter(date_block_num < target_month) %>%
+    dplyr::mutate(
+      is_no_sales = ifelse(is.na(item_cnt_day), 1 ,0),
+      item_cnt_day = ifelse(is.na(item_cnt_day), 0 ,item_cnt_day)
+    ) %>%
+    dplyr::group_by(shop_id, item_id, date_block_num) %>%
+    dplyr::summarise(
+      total_num_sales = sum(item_cnt_day, na.rm = TRUE),
+      is_no_sales = max(is_no_sales, na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::group_by(shop_id, item_id) %>%
+    dplyr::summarise(
+      total_num_sales_min = min(total_num_sales, na.rm = TRUE),
+      total_num_sales_mean = mean(total_num_sales, na.rm = TRUE),
+      total_num_sales_median = median(total_num_sales, na.rm = TRUE),
+      total_num_sales_max = max(total_num_sales, na.rm = TRUE),
+      total_num_sales_sd = sd(total_num_sales, na.rm = TRUE),
+      no_sales = sum(is_no_sales, na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup()
+  
+  # 5. stats of revenue summarized by shop_id
+  data5 <- df %>%
+    dplyr::filter(date_block_num < target_month) %>%
+    dplyr::mutate(
+      revenue = ifelse(is.na(revenue), 0 ,revenue)
+    ) %>%
+    dplyr::group_by(shop_id, date_block_num) %>%
+    dplyr::summarise(
+      total_sales = sum(revenue, na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::group_by(shop_id) %>%
+    dplyr::summarise(
+      total_sales_min = min(total_sales, na.rm = TRUE),
+      total_sales_mean = mean(total_sales, na.rm = TRUE),
+      total_sales_median = median(total_sales, na.rm = TRUE),
+      total_sales_max = max(total_sales, na.rm = TRUE),
+      total_sales_sd = sd(total_sales, na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup()
+  
+  # 6. num of items at each shop
+  data6 <- df %>%
+    dplyr::filter(!is.na(date)) %>%
+    dplyr::filter(date_block_num < target_month) %>%
+    dplyr::group_by(shop_id) %>%
+    dplyr::summarise(
+      num_item = n_distinct(item_id)
+    ) %>%
+    dplyr::ungroup()
+  
+  # 7. max number of sales with same item categories in past period 
+  data7 <- df %>%
+    dplyr::filter(!is.na(date)) %>%
+    dplyr::group_by(shop_id, item_id, date_block_num) %>%
+    dplyr::summarise(
+      total_num_sales = sum(item_cnt_day, na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(shop_id, item_id, date_block_num) %>%
+    dplyr::distinct(shop_id, item_id, .keep_all = TRUE) %>%
+    dplyr::filter(date_block_num < target_month) %>%
+    dplyr::left_join(items, by = "item_id") %>%
+    dplyr::group_by(shop_id, item_category_id) %>%
+    dplyr::summarise(
+      past_total_num_sales_max = max(total_num_sales, na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup()
+  
+  # 8. target 
+  target <- df %>%
+    dplyr::filter(date_block_num == target_month) %>%
+    dplyr::group_by(shop_id, item_id) %>%
+    dplyr::summarise(
+      total_num_sales = sum(item_cnt_day, na.rm = TRUE),
+      price = mean(item_price, na.rm = TRUE)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      total_num_sales = ifelse(is.na(total_num_sales), 0, total_num_sales),
+      total_num_sales_limited = ifelse(total_num_sales > 20, 20, total_num_sales)  # why choose 20
+    )
+  
+  # data merge
+  data <- target %>%
+    dplyr::left_join(data1, by = c("shop_id", "item_id")) %>%
+    dplyr::left_join(data2, by = c("item_id")) %>%
+    dplyr::left_join(data3, by = c("shop_id", "item_id")) %>%
+    dplyr::left_join(data4, by = c("shop_id", "item_id")) %>%
+    dplyr::left_join(data5, by = c("shop_id")) %>%
+    dplyr::left_join(data6, by = c("shop_id")) %>%
+    dplyr::left_join(items, by = "item_id") %>%
+    dplyr::left_join(data7, by = c("shop_id", "item_category_id")) %>%
+    dplyr::left_join(item_cat, by = "item_category_id") %>%
+    dplyr::left_join(shops, by = "shop_id") %>%
+    dplyr::mutate(
+      # replace na
+      last_price1 = ifelse(last_price1 != 0, last_price1,
+                           ifelse(is.na(price_median), price_median_all, price_median)),
+      last_price2 = ifelse(last_price2 != 0, last_price2,
+                           ifelse(is.na(price_median), price_median_all, price_median)),
+      last_price3 = ifelse(last_price3 != 0, last_price3,
+                           ifelse(is.na(price_median), price_median_all, price_median)),
+      last_price4 = ifelse(last_price4 != 0, last_price4,
+                           ifelse(is.na(price_median), price_median_all, price_median)),
+      last_price5 = ifelse(last_price5 != 0, last_price5,
+                           ifelse(is.na(price_median), price_median_all, price_median)),
+      price_min = ifelse(is.na(price_min), price_min_all, price_min),
+      price_mean = ifelse(is.na(price_mean), price_mean_all, price_mean),
+      price_median = ifelse(is.na(price_median), price_median_all, price_median),
+      price_max = ifelse(is.na(price_max), price_max_all, price_max),
+      price_sd = ifelse(is.na(price_sd), price_sd_all, price_sd),
+      
+      # trend of item price
+      diff_price1 = last_price1 - price_median,
+      diff_price2 = last_price1 - price_median_all,
+      
+      # total sales period
+      duration = ifelse(is.na(first_month), 0, target_month - first_month),
+      
+      # correct no sales period
+      no_sales = ifelse(no_sales > duration, duration, no_sales),
+      
+      # trend of num of sales
+      diff_sales_mean = last_sales1 - total_num_sales_mean,
+      diff_sales_max = last_sales1 - total_num_sales_max,
+      diff_sales_1 = last_sales1 - last_sales2,
+      diff_sales_2 = last_sales1 - last_sales3,
+      diff_sales_3 = last_sales1 - last_sales4,
+      diff_sales_4 = last_sales1 - last_sales5,
+      
+      # create flag of release month   # what is release month
+      is_release_month = ifelse(duration == 0, 1, 0),
+      
+      # correct last num of sales of new items
+      last_sales1 = ifelse(is_release_month == 1, past_total_num_sales_max, last_sales1),
+      
+      # month
+      month = date_block_num %% 12
+    ) %>%
+    # replace na with 0
+    dplyr::mutate_at(vars(starts_with("last_"), starts_with("price_"), starts_with("diff_")), 
+                     list(~ifelse(is.na(.), 0, .)))
+
+    # calculate dummy colomuns  # why do this? predict()??
+  dummy_col <- dummyVars(~., data = data %>% dplyr::select(
+    item_category_id,
+    item_category_name,
+    shop_name))
+  data <- data %>%
+    dplyr::bind_cols(predict(dummy_col, data) %>% as.data.frame())
+  
+  return(data)
+  
+}
+
+```
+
+```{r}
+# create the data
+train_data <- create_features(sub_train, 32)
+valid_data <- create_features(sub_train, 33)
+pred_data <- create_features(sub_train, 34)
+
+rm(sub_train)
+rm(train)
+rm(shops)
+rm(items)
+rm(item_cat)
+gc()
+```
+
+#### xgboost function
+
+```{r}
+fit_xgboost <- function(X_Train, Y_Train){
+  
+  X_Train <- X_Train %>% as.matrix()
+  Y_Train <- Y_Train %>% as.matrix()
+  
+  # parameter settings
+  set.seed(17)
+  param <- list(objective = "reg:linear",
+                eval_metric = "rmse",
+                eta = 0.07,
+                max_depth = 5,
+                min_child_weight = 10,
+                colsample_bytree = 1,
+                gamma = 0.9,
+                alpha = 1.0,
+                subsample = 0.7
+  )
+  
+  # parallel calculation
+  N_cpu = detectCores()
+  
+  # find nrounds with cross-validation
+  xgbcv <- xgb.cv(param = param, data = X_Train, label = Y_Train,
+                  nrounds = 100,
+                  nfold = 5,
+                  nthread = N_cpu
+  )
+  
+  # modling
+  set.seed(17)
+  model_xgb <- xgboost(param = param, data = X_Train, label = Y_Train,
+                       nrounds = which.min(xgbcv$evaluation_log$test_rmse_mean),
+                       nthread = N_cpu, importance = TRUE)
+  
+  return(model_xgb)
+}
+```
+
+
+#### run the model
+
+```{r}
+x_train <- train_data %>%  # why delete some specific variables?
+  dplyr::select(
+    starts_with("price_"),
+    -first_month,
+    starts_with("last_"),
+    starts_with("total_num_sales_"),
+    -total_num_sales_limited,
+    starts_with("total_sales_"),
+    num_item,
+    starts_with("diff_"),
+    duration,
+    no_sales,
+    starts_with("diff_sales_"),
+    is_release_month,
+    month,
+    starts_with("item_category_id"),
+    -item_category_id,
+    -item_category_id0,
+    -last_sales2,
+    -last_sales3,
+    -price_sd,
+    -price_min,
+    -price_mean,
+    -price_median,
+    -price_mean_all,
+    -price_median_all,
+    -price_max_all,
+    -last_price1,
+    -last_price2,
+    -last_price3,
+    -last_price4,
+    -last_price5
+  )
+
+y_train <- train_data %>%
+  dplyr::select(total_num_sales_limited)
+
+
+x_valid_train <- valid_data %>%
+    dplyr::select(
+    starts_with("price_"),
+    -first_month,
+    starts_with("last_"),
+    starts_with("total_num_sales_"),
+    -total_num_sales_limited,
+    starts_with("total_sales_"),
+    num_item,
+    starts_with("diff_"),
+    duration,
+    no_sales,
+    starts_with("diff_sales_"),
+    is_release_month,
+    month,
+    starts_with("item_category_id"),
+    -item_category_id,
+    -item_category_id0,
+    -last_sales2,
+    -last_sales3,
+    -price_sd,
+    -price_min,
+    -price_mean,
+    -price_median,
+    -price_mean_all,
+    -price_median_all,
+    -price_max_all,
+    -last_price1,
+    -last_price2,
+    -last_price3,
+    -last_price4,
+    -last_price5
+  )
+
+y_valid_train <- valid_data %>%
+  dplyr::select(total_num_sales_limited)
+
+
+# calculate modeling
+model_xgb <- fit_xgboost(x_train, y_train)
+
+gc()
+
+# output importance
+imp1 <- xgb.importance(names(x_train), model = model_xgb)
+
+imp1 %>%
+  ggplot()+
+  geom_bar(mapping = aes(x = reorder(Feature, Gain), y = Gain), 
+           stat = "identity")+
+  coord_flip()
+
+```
+
+
+### Time series approach
+
+### Use Prophet
+
+```{r}
+df <- sales_train_dat %>% group_by(date_block_num) %>% summarise(sales = sum(item_cnt_day)) %>% select(date_block_num, sales)
+
+date <- make_date(year = 2013, month = 1:12, day = 1)
+date <- c(date, make_date(year = 2014, month = 1:12, day = 1), make_date(year = 2015, month = 1:10, day = 1))
+
+# rename to use prophet
+df$ds <- date
+df$date_block_num <- NULL
+colnames(df) <- c("y", "ds")
+
+# model
+model_prophet <- prophet(df)
+
+future <- make_future_dataframe(model_prophet, periods = 1, freq = "month")
+
+fcst_prophet <- predict(model_prophet, future)
+
+plot(model_prophet, fcst_prophet)
+
+# can't continue because couldn't find a way to predict for each item-shop combination. tried to use prophet for every combination, i.e.make a time series for each item-shop, and add the output together. But the amount is too large, and some combinations have few data points.
+```
+
+
+#### Use hierarchical time series
+
+```{r}
+# can't figure out what's the import bottom time series in hts() function
+```
+
+
+### Model comparison and selection
+
+#### evaluation metrics
+
+Choose RMSE and R^2 as our evaluation metrics.
+
+**Reasons** 
+
+- RMSE: the square root of MSE(Mean Squared Error), first it is derived from MSE, which avoids the problem of non-smooth function. Also, because of the square root, the dimension of RMSE is consistent to our target variable, which is easy to interpret.
+- R^2: The coefficient of determination can reflect the proportion of the total variation of the dependent variable that can be explained by the independent variable through a regression relationship. This is very easy to interpret as well.
+
+#### compute
+
+```{R}
+# RMSE of xgboost
+# train RMSE
+train_train.pred <- train_data %>%
+  dplyr::bind_cols(pred = predict(model_xgb, newdata = x_train %>% as.matrix(), type = "response")) %>%
+  dplyr::mutate(error = total_num_sales_limited - pred)
+
+train_train.pred %>%
+  dplyr::summarise(
+    RMSE = sqrt(sum(abs(error^2))/n())
+  )
+
+# valid RMSE
+valid_train.pred <- valid_data %>%
+  dplyr::bind_cols(pred = predict(model_xgb, newdata = x_valid_train %>% as.matrix(), type = "response")) %>%
+  dplyr::mutate(error = total_num_sales_limited - pred)
+
+valid_train.pred %>%
+  dplyr::summarise(
+    RMSE = sqrt(sum(abs(error^2))/n())
+  )
+
+
+# R^2 of xgboost
+# train R^2
+train_train.pred%>%
+  dplyr::summarise(
+    R_square = 1-sum(abs(train_train.pred$error^2))/n()/var(train_data$total_num_sales_limited)
+  )
+
+# valid R^2
+valid_train.pred %>%
+  dplyr::summarise(
+    R_square = 1-sum(abs(valid_train.pred$error^2))/n()/var(valid_data$total_num_sales_limited)
+  )
+```
+
+
+### Prediction
+
+Use xgboost model to predict for the next month.
+
+```{r}
+x_pred <- pred_data %>%
+dplyr::select(
+    starts_with("price_"),
+    -first_month,
+    starts_with("last_"),
+    starts_with("total_num_sales_"),
+    -total_num_sales_limited,
+    starts_with("total_sales_"),
+    num_item,
+    starts_with("diff_"),
+    duration,
+    no_sales,
+    starts_with("diff_sales_"),
+    is_release_month,
+    month,
+    starts_with("item_category_id"),
+    -item_category_id,
+    -item_category_id0,
+    -last_sales2,
+    -last_sales3,
+    -price_sd,
+    -price_min,
+    -price_mean,
+    -price_median,
+    -price_mean_all,
+    -price_median_all,
+    -price_max_all,
+    -last_price1,
+    -last_price2,
+    -last_price3,
+    -last_price4,
+    -last_price5
+  )
+
+y_pred <- pred_data%>%
+  dplyr::bind_cols(item_cnt_month = predict(model_xgb, newdata = x_pred %>% as.matrix(), type = "response")) %>%
+  dplyr::left_join(test, by = c("shop_id", "item_id")) %>%
+  dplyr::select(ID, item_cnt_month) %>%
+  dplyr::mutate(item_cnt_month = ifelse(item_cnt_month > 20, 20, ifelse(item_cnt_month < 0, 0, item_cnt_month)))
+
+fwrite(y_pred, "../report/submission.csv", quote = "auto", sep = ",",
+       row.names = FALSE, col.names = TRUE)
+```
+
